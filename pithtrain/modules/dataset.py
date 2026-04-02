@@ -36,6 +36,15 @@ class MemmapDataset:
         labels = torch.tensor(self.tokens[start + 1 : end + 1])
         return tokens, labels
 
+    def get_chunk(
+        self, idx: int, seq_offset: int, seq_length: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Read only [seq_offset, seq_offset + seq_length) of a sequence."""
+        start = idx * self.sequence_length + seq_offset
+        tokens = torch.tensor(self.tokens[start : start + seq_length])
+        labels = torch.tensor(self.tokens[start + 1 : start + seq_length + 1])
+        return tokens, labels
+
 
 class ConcatDataset:
     """
@@ -69,8 +78,20 @@ class ConcatDataset:
     def __len__(self):
         return self.offsets[-1]
 
-    def __getitem__(self, idx: int):
+    def _resolve(self, idx: int) -> Tuple[MemmapDataset, int]:
+        """Map a global shuffled index to (dataset, local_index)."""
         p = self.indices[idx]
         x = np.searchsorted(self.offsets, p, side="right")
         y = p if x == 0 else p - self.offsets[x - 1]
-        return self.memmap_datasets[x][y]
+        return self.memmap_datasets[x], y
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        ds, local_idx = self._resolve(idx)
+        return ds[local_idx]
+
+    def get_chunk(
+        self, idx: int, seq_offset: int, seq_length: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Read a sub-range of a sequence by index, delegating to the underlying dataset."""
+        ds, local_idx = self._resolve(idx)
+        return ds.get_chunk(local_idx, seq_offset, seq_length)

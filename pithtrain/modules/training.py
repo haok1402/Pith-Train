@@ -158,6 +158,32 @@ class TrainingCfg(SlottedDefault):
     `nsys_stop=N+1`. Set to ``None`` to disable.
     """
 
+    memory_profile_start: Optional[int] = None
+    """
+    Training step at which to start recording CUDA memory allocation history.
+
+    When set, ``torch.cuda.memory._record_memory_history`` is called at the
+    beginning of this step with full stack traces for both allocations and frees.
+    Set to ``None`` to disable.
+    """
+
+    memory_profile_stop: Optional[int] = None
+    """
+    Training step at which to stop recording and dump the memory snapshot.
+
+    At the beginning of this step the recorded history is dumped to
+    ``memory_profile_output`` and recording is disabled. To profile a single
+    step ``N``, set ``memory_profile_start=N`` and ``memory_profile_stop=N+1``.
+    Set to ``None`` to disable.
+    """
+
+    memory_profile_output: Path = Path.cwd()
+    """
+    Output directory for the CUDA memory snapshot. Each rank writes a pickle
+    file named ``snapshot-rank00000.pickle`` etc. into this directory.
+    The snapshot can be visualized at https://pytorch.org/memory_viz.
+    """
+
 
 @dataclass(init=False, slots=True)
 class TrainingCtx:

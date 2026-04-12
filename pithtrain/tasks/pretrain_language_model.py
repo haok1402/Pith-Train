@@ -353,10 +353,13 @@ def train_step(cfg: PretrainLanguageModelCfg, ctx: PretrainLanguageModelCtx) -> 
     """
     Execute one step of training.
     """
-    if cfg.training.nsys_start is not None and ctx.training.step == cfg.training.nsys_start:
+    # Start the nsys and the memory profiler.
+    start = cfg.training.nsys_start
+    if start is not None and ctx.training.step == start:
         torch.cuda.cudart().cudaProfilerStart()
-    if cfg.training.nsys_stop is not None and ctx.training.step == cfg.training.nsys_stop:
-        torch.cuda.cudart().cudaProfilerStop()
+    start = cfg.training.memory_profile_start
+    if start is not None and ctx.training.step == start:
+        torch.cuda.memory._record_memory_history(max_entries=65536, stacks="python")
 
     device = torch.cuda.current_device()
     t0 = time.time()
@@ -469,6 +472,18 @@ def train_step(cfg: PretrainLanguageModelCfg, ctx: PretrainLanguageModelCtx) -> 
 
     # Increment the step counter.
     ctx.training.step += 1
+
+    # Stop the nsys and the memory profiler.
+    stop = cfg.training.nsys_stop
+    if stop is not None and ctx.training.step == stop:
+        torch.cuda.cudart().cudaProfilerStop()
+    stop = cfg.training.memory_profile_stop
+    if stop is not None and ctx.training.step == stop:
+        rank = ctx.distributed.rank
+        cfg.training.memory_profile_output.mkdir(parents=True, exist_ok=True)
+        path = Path(cfg.training.memory_profile_output, "snapshot-rank%05d.pickle" % rank)
+        torch.cuda.memory._dump_snapshot(str(path))
+        torch.cuda.memory._record_memory_history(enabled=None)
 
     # We should save the checkpoint if any of the following conditions is true:
     # 1. The current step is a multiple of save_interval.

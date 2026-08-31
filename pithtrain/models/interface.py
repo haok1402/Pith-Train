@@ -1,20 +1,16 @@
-from typing import Dict, List, NamedTuple, Optional, Protocol, Tuple
+from typing import Dict, NamedTuple, Optional, Protocol, Tuple
 
 import torch
 
 
-class AllToAllSplits(NamedTuple):
-    input_splits: List[int]
-    output_splits: List[int]
-
-
 class RoutingInfo(NamedTuple):
     topk_weight: torch.Tensor
-    expert_idxs: torch.Tensor
+    expert_idxs: Optional[torch.Tensor] = None
     moe_local_idxs: Optional[torch.Tensor] = None
     expand_idx: Optional[torch.Tensor] = None
-    dispatch_splits: Optional[AllToAllSplits] = None
-    combine_splits: Optional[AllToAllSplits] = None
+    topk_idx: Optional[torch.Tensor] = None
+    num_experts: int = 0
+    num_recv_pairs: int = 0
 
 
 class MLPProtocol(Protocol):
@@ -31,9 +27,9 @@ class LayerProtocol(Protocol):
     micro-batches and overlap the compute of one with the communication of another.
 
     - Stage 1: pre-dispatch compute.
-    - Stage 2: dispatch all-to-all.
+    - Stage 2: DeepEP expert dispatch.
     - Stage 3: expert compute.
-    - Stage 4: combine all-to-all.
+    - Stage 4: DeepEP expert combine.
     - Stage 5: post-combine compute.
     """
 
@@ -63,10 +59,14 @@ class LayerProtocol(Protocol):
         gathered_tokens: torch.Tensor,
         expert_idxs: Optional[torch.Tensor] = None,
         expand_idx: Optional[torch.Tensor] = None,
+        moe_local_idxs: Optional[torch.Tensor] = None,
+        recv_topk_weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Stage 3, the expert compute (runs after the stage-2 dispatch and before the stage-4 combine).
-        Run the experts (or dense MLP) on the dispatched tokens.
+        Run the experts (or dense MLP) on the dispatched tokens. With DeepEP dispatch,
+        ``moe_local_idxs``/``recv_topk_weights`` are set and the router weights are
+        applied here so the unweighted combine can sum each rank's partial output.
         """
 
     def forward_stage5(

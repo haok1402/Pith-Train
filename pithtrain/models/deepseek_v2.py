@@ -12,6 +12,7 @@ from pithtrain.dualpipe.dualpipev import layer_partition
 from pithtrain.dualpipe.execution import ChunkRecord, model_forward
 from pithtrain.models.interface import RoutingInfo
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
+from pithtrain.operators.deepep import weighted_combine_input
 from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
 from pithtrain.operators.ring_attention import mla_ring_attention_func
@@ -175,6 +176,7 @@ class DeepSeekV2MoE(nn.Module):
     def __init__(self, config: DeepseekV2Config):
         super().__init__()
         self.num_experts_per_tok = config.num_experts_per_tok
+        self.ep_rank = distributed.ep_rank
         self.experts_per_rank = config.n_routed_experts // distributed.ep_size
         self.n_routed_experts = config.n_routed_experts
         self.experts = DeepSeekV2Experts(config, self.experts_per_rank)
@@ -317,7 +319,9 @@ class DeepSeekV2DecoderLayer(nn.Module):
             return hidden_states, residual, None
         if lb_loss is not None:
             MoELoadBalanceLossTracker.add(lb_loss)
-        dispatch_tokens, routing = prepare_dispatch(hidden_states, topk_idx, topk_weight, self.mlp.n_routed_experts, distributed.ep_size, self.mlp.experts_per_rank, distributed.ep_group)  # fmt: skip
+        dispatch_tokens, routing = prepare_dispatch(
+            hidden_states, topk_idx, topk_weight, self.mlp.n_routed_experts, distributed.ep_size
+        )
         return dispatch_tokens, residual, routing
 
     def forward_stage3(
@@ -325,15 +329,21 @@ class DeepSeekV2DecoderLayer(nn.Module):
         gathered_tokens: torch.Tensor,
         expert_idxs: torch.Tensor | None = None,
         expand_idx: torch.Tensor | None = None,
+        moe_local_idxs: torch.Tensor | None = None,
+        recv_topk_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if isinstance(self.mlp, DeepSeekV2MLP):
             return self.mlp(gathered_tokens)
+        num_recv_tokens = gathered_tokens.shape[0]
         if distributed.ep_size > 1:
             gathered_tokens = padded_index_gather(gathered_tokens, expand_idx)
         output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = scatter_for_grouped_gemm(gathered_tokens, expert_idxs, self.mlp.experts_per_rank)  # fmt: skip
         del gathered_tokens
         outs = self.mlp.experts(output_tokens, grouped_mm_offs, ks=ks, ks_tensor=ks_tensor)
-        return padded_index_gather(outs, reverse_shuffle_idxs)
+        outs = padded_index_gather(outs, reverse_shuffle_idxs)
+        if recv_topk_weights is not None:
+            return weighted_combine_input(outs, moe_local_idxs, recv_topk_weights, num_recv_tokens)
+        return outs
 
     @torch.compile(fullgraph=True)
     def forward_stage5(
@@ -345,6 +355,8 @@ class DeepSeekV2DecoderLayer(nn.Module):
     ):
         if not isinstance(self.mlp, DeepSeekV2MoE):
             return residual + moe_outs
+        if topk_weight is None:
+            return residual + moe_outs.view(*residual.shape)
         if distributed.ep_size == 1:
             weighted = moe_outs.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)
             return residual + weighted.sum(dim=1).to(moe_outs.dtype).view(*residual.shape)

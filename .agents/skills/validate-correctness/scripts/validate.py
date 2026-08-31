@@ -1,6 +1,7 @@
 """Run training steps from a released checkpoint for correctness validation."""
 
 import argparse
+import os
 from pathlib import Path
 
 from pithtrain.modules.training import make_adamw_optimizer, make_constant_scheduler
@@ -55,6 +56,16 @@ training.moe_load_balance_type = specs["moe_load_balance_type"]
 training.moe_load_balance_coef = specs["moe_load_balance_coef"]
 training.fp8 = False
 training.save_location = Path(specs["save_location"])
+
+wandb_name = os.environ.get("VAL_WANDB_NAME")
+if wandb_name is not None:
+    from pithtrain.modules.logging import LoggingWandbCfg
+
+    cfg.logging.wandb = LoggingWandbCfg()
+    cfg.logging.wandb.entity = os.environ.get("VAL_WANDB_ENTITY", "Pith-Train")
+    cfg.logging.wandb.project = os.environ.get("VAL_WANDB_PROJECT", "DeepEP")
+    cfg.logging.wandb.group = os.environ.get("VAL_WANDB_GROUP")
+    cfg.logging.wandb.name = wandb_name
 
 if __name__ == "__main__":
     launch(cfg)

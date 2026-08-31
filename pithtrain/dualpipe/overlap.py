@@ -80,7 +80,7 @@ def overlapped_forward_backward(
     ctx.bwd_event = torch.cuda.Event()
     ctx.fwd_comm_work = None
     ctx.bwd_comm_work = None
-    ctx.fwd_comm_deferred_free = []
+    ctx.fwd_deepep_handle = None
 
     # Module 1 layer L-1 stage 5 backward
     if loss1 is not None:
@@ -152,18 +152,8 @@ def overlapped_forward_backward(
                 _clear_layer_records(chunk_record1.layers[-l])
 
             # Module 0 layer l-1 stage 4 forward
-            record, moe_outs = stage4_f(
-                ctx,
-                module0_layers[l - 1],
-                moe_outs,  # noqa: F821
-                routing.combine_splits if routing is not None else None,
-                ep_group,
-            )
+            record, moe_outs = stage4_f(ctx, module0_layers[l - 1], moe_outs, ep_group)  # noqa: F821
             chunk_record0.layers[layer_idx0].stage4.ctx = record.ctx
-            if routing is not None and ctx.fwd_comm_work is not None:
-                ctx.fwd_comm_deferred_free.append(
-                    chunk_record0.layers[layer_idx0].stage3.outs.moe_outs
-                )  # freed after Stage 5 waits
 
             # Module 1 layer L-l-1 stage 4 backward
             record = chunk_record1.layers[-l - 1].stage4
@@ -216,24 +206,24 @@ def overlapped_forward_backward(
 
         # Module 1 layer L-l-1 stage 3 backward
         record = chunk_record1.layers[-l - 1].stage3
-        gathered_tokens_grad = stage3_b(ctx, module1_layers[-l - 1], record, (moe_outs_grad,))
+        gathered_tokens_grad, recv_topk_weights_grad = stage3_b(
+            ctx, module1_layers[-l - 1], record, (moe_outs_grad,)
+        )
 
         # Module 0 layer l stage 2 forward
-        record, gathered_tokens = stage2_f(
+        record, gathered_tokens, recv_routing = stage2_f(
             ctx,
             module0_layers[l],
             dispatch_tokens,
-            routing.dispatch_splits if routing is not None else None,
+            routing,
             ep_group,
         )
         chunk_record0.layers[layer_idx0].stage2.ctx = record.ctx
-        if routing is not None and ctx.fwd_comm_work is not None:
-            ctx.fwd_comm_deferred_free.append(dispatch_tokens)  # freed after Stage 3 waits
 
         # Module 1 layer L-l-1 stage 2 backward
         record = chunk_record1.layers[-l - 1].stage2
-        dispatch_tokens_grad = stage2_b(
-            ctx, module1_layers[-l - 1], record, (gathered_tokens_grad,)
+        dispatch_tokens_grad, topk_weight_grad = stage2_b(
+            ctx, module1_layers[-l - 1], record, (gathered_tokens_grad, recv_topk_weights_grad)
         )
 
         # Module 1 layer L-l-1 stage 3 weight backward
@@ -244,25 +234,14 @@ def overlapped_forward_backward(
             ctx,
             module0_layers[l],
             gathered_tokens,
-            routing.expert_idxs if routing is not None else None,
-            routing.expand_idx if routing is not None else None,
+            recv_routing,
         )
         chunk_record0.layers[layer_idx0].stage3.args = record.args
         chunk_record0.layers[layer_idx0].stage3.outs = record.outs
 
     # Module 0 layer L-1 stage 4 forward
-    record, moe_outs = stage4_f(
-        ctx,
-        module0_layers[num_layers - 1],
-        moe_outs,
-        routing.combine_splits if routing is not None else None,
-        ep_group,
-    )
+    record, moe_outs = stage4_f(ctx, module0_layers[num_layers - 1], moe_outs, ep_group)
     chunk_record0.layers[layer_idx0].stage4.ctx = record.ctx
-    if routing is not None and ctx.fwd_comm_work is not None:
-        ctx.fwd_comm_deferred_free.append(
-            chunk_record0.layers[layer_idx0].stage3.outs.moe_outs
-        )  # freed after Stage 5 waits
 
     # Module 1 layer 0 stage 1 backward
     record = chunk_record1.layers[-num_layers].stage1

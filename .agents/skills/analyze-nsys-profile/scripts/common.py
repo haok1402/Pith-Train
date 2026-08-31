@@ -40,12 +40,12 @@ def streams_in_window(con: sqlite3.Connection, pid: int, start: int, end: int) -
     cur.execute(
         """
         SELECT k.streamId,
-               SUM(CASE WHEN s.value LIKE 'nccl%' THEN 1 ELSE 0 END) AS n_comm,
-               SUM(CASE WHEN s.value NOT LIKE 'nccl%' THEN 1 ELSE 0 END) AS n_comp,
-               SUM(CASE WHEN s.value LIKE 'nccl%' THEN k.end - k.start ELSE 0 END) AS comm_ns,
-               SUM(CASE WHEN s.value NOT LIKE 'nccl%' THEN k.end - k.start ELSE 0 END) AS comp_ns
+               SUM(CASE WHEN s.value LIKE 'nccl%' OR s.value LIKE '%deep_ep::%' THEN 1 ELSE 0 END) AS n_comm,
+               SUM(CASE WHEN s.value NOT LIKE 'nccl%' AND s.value NOT LIKE '%deep_ep::%' THEN 1 ELSE 0 END) AS n_comp,
+               SUM(CASE WHEN s.value LIKE 'nccl%' OR s.value LIKE '%deep_ep::%' THEN k.end - k.start ELSE 0 END) AS comm_ns,
+               SUM(CASE WHEN s.value NOT LIKE 'nccl%' AND s.value NOT LIKE '%deep_ep::%' THEN k.end - k.start ELSE 0 END) AS comp_ns
         FROM CUPTI_ACTIVITY_KIND_KERNEL k
-        JOIN StringIds s ON k.shortName = s.id
+        JOIN StringIds s ON k.demangledName = s.id
         WHERE k.globalPid / 0x1000000 % 0x1000000 = ? AND k.start >= ? AND k.end <= ?
         GROUP BY k.streamId
         ORDER BY k.streamId

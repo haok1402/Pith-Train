@@ -3,7 +3,7 @@ name = "pithtrain"
 version = "0.1.3"
 license = "Apache-2.0"
 requires-python = ">=3.12"
-dependencies = ["deep-gemm", "flash-attn-4[cu13]>=4.0.0b20", "flash-linear-attention>=0.5.1", "torch>=2.12.0", "transformers", "wandb", "zstandard"]
+dependencies = ["deep-ep", "deep-gemm", "flash-attn-4[cu13]>=4.0.0b20", "flash-linear-attention>=0.5.1", "ninja", "pybind11", "torch>=2.12.0", "transformers", "wandb", "zstandard"]
 
 [dependency-groups]
 dev = ["pre-commit", "pytest", "ruff"]
@@ -18,6 +18,10 @@ include = ["pithtrain*"]
 [tool.uv]
 prerelease = "allow"
 environments = ["sys_platform == 'linux'"]
+# torch >=2.12 cu130 wheels pin nvidia-nccl-cu13==2.29.7; DeepEP needs >=2.30.4
+override-dependencies = ["nvidia-nccl-cu13>=2.31.2"]
+# deep-ep builds against the project env; isolated builds re-resolve torch's nccl pin
+no-build-isolation-package = ["deep-ep"]
 
 [[tool.uv.index]]
 name = "torch-cu130"
@@ -25,6 +29,7 @@ url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.uv.sources]
+deep-ep = { git = "https://github.com/deepseek-ai/DeepEP", rev = "01dc3aa" }
 deep-gemm = { git = "https://github.com/deepseek-ai/DeepGEMM", branch = "main" }
 torch = { index = "torch-cu130" }
 

@@ -36,7 +36,7 @@ def extract_overlap(con: sqlite3.Connection, pid: int, start: int, end: int) -> 
     comp_intervals = [
         (k["start"], k["end"])
         for k in kernels
-        if k["stream"] in comp_streams and not k["name"].startswith("nccl")
+        if k["stream"] in comp_streams
     ]
 
     comm_kernels = [k for k in kernels if k["stream"] in comm_streams]
@@ -67,6 +67,7 @@ def extract_overlap(con: sqlite3.Connection, pid: int, start: int, end: int) -> 
         out.append(
             {
                 "stage": stage,
+                "comm_ns": stats["comm_ns"],
                 "exposed_ns": stats["exposed_ns"],
                 "overlap": f"{overlap_pct}%",
                 "overlap_min": f"{round(min(per_kernel_pct), 2)}%" if per_kernel_pct else "0.0%",

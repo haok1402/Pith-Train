@@ -31,7 +31,6 @@ Style: 100-char line length, double quotes, `py312` target. Rules: E, F, I, W (i
 pytest tests/operators/test_deepgemm_quantize.py -v
 pytest tests/test_deepgemm_fp8_linear_correctness.py -v
 pytest tests/test_grouped_linear_correctness.py -v
-pytest tests/test_ep_dedup_dispatch.py -v
 pytest tests/test_silu_mul.py tests/test_clamped_swiglu.py tests/test_indexed_bias_add.py -v
 pytest tests/operators/test_ring_attention.py -v
 
@@ -78,12 +77,14 @@ python -m tools.memory_estimator --help   # peak-memory simulator for a given pa
 The core pipeline assigns each rank two model chunks in a V-shape (the model is cut into `2 * pp_size` chunks; rank `r` holds chunks `r` and `2*pp_size-1-r`) and overlaps forward and backward execution across micro-batches. Each transformer layer is split into 5 stages:
 
 1. **Attention** — LayerNorm + Attention + LayerNorm + Expert routing
-2. **Dispatch** — All-to-all send tokens to assigned experts (async on comm stream)
+2. **Dispatch** — DeepEP `Buffer.dispatch` sends tokens to their experts' ranks, deduplicating per destination rank (runs on the buffer's internal comm stream)
 3. **MLP** — Expert/MLP computation
-4. **Combine** — All-to-all gather expert outputs (async on comm stream)
+4. **Combine** — DeepEP `Buffer.combine` sums each rank's weighted expert outputs back onto the token owner's rank
 5. **Aggregate** — Weighted expert output + residual connection
 
-Stages 1, 3, and 5 are the layer's compute entry points — `forward_stage1`, `forward_stage3`, `forward_stage5` on `LayerProtocol` (`pithtrain/models/interface.py`); stages 2 and 4 are all-to-all communication driven by the execution machinery (`pithtrain/dualpipe/execution.py`), not layer methods.
+Stages 1, 3, and 5 are the layer's compute entry points — `forward_stage1`, `forward_stage3`, `forward_stage5` on `LayerProtocol` (`pithtrain/models/interface.py`); stages 2 and 4 are DeepEP communication driven by the execution machinery (`pithtrain/dualpipe/execution.py`), not layer methods.
+
+**DeepEP is the only expert-parallel pathway** (`pithtrain/operators/deepep.py`): for `ep_size > 1` the router's `topk_idx`/`topk_weight` are handed to the legacy `deep_ep.Buffer` in stage 2, which returns rank-deduplicated `recv_x` plus per-row local expert ids. Stage 3 expands the received rows per (token, local expert) pair, runs the grouped-GEMM experts, and applies the router weights expert-side (`weighted_combine_input`) so the unweighted combine can sum partials across ranks; stage 5 is then a plain residual add. Backward follows DeepEP's documented autograd pattern — dispatch's backward is a weighted combine that also returns the router-weight gradients, combine's backward is a dispatch reusing the forward handle. At `ep_size == 1` no communication happens and stage 3 runs the local expanded grouped GEMM directly.
 
 Key files:
 - `dualpipev.py` — Main scheduler: `DualPipeV.step()` orchestrates overlapped F/B across modules (supports `forward_only=True` for inference), plus `layer_partition()`, which distributes decoder layers across pipeline stages — edge stages (which hold `embed_tokens` / `norm`+`lm_head`) get fewer layers to balance memory.
@@ -121,8 +122,8 @@ The pipeline is **BSHD** end to end: hidden states are `(B, S, hidden)` through 
 - **Ring Attention** (`ring_attention.py`) — zigzag ring attention for context parallelism (standard and MLA-aware variants)
 - **FlashAttention v4** (`flash_attn_v4.py`) — Wrapper around the FA4 kernel
 - **MLA** — Multi-head Latent Attention is implemented inside the DeepSeek model (`models/deepseek_v2.py`), with MLA-aware ring attention in `ring_attention.py`
-- **AllToAll** (`all_to_all.py`) — Differentiable collective wrapper
-- **EP Dispatch** (`ep_dispatch.py`) — Fused Triton kernels and orchestration for expert-parallel token dispatch with deduplication
+- **DeepEP** (`deepep.py`) — Legacy `deep_ep.Buffer` singleton and the dispatch/combine forward/backward helpers used by DualPipeV stages 2/4
+- **EP Dispatch** (`ep_dispatch.py`) — Dispatch hand-off: routes `ep_size > 1` to DeepEP, expands tokens per selected expert locally at `ep_size == 1`
 - **Token Scatter** (`token_scatter.py`) — Triton scatter kernels for grouping tokens by expert ahead of grouped GEMM
 - **FP8 Quantization** (`deepgemm_quantize.py`) — Fused Triton kernels for DeepGEMM-style FP8 quantization
 - **Fused activations / heads** — `silu_mul.py`, `clamped_swiglu.py`, `indexed_bias_add.py`, `cross_entropy.py`

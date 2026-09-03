@@ -185,7 +185,7 @@ class GptOssTopKRouter(nn.Module):
         scores = logits.softmax(dim=-1, dtype=torch.float32)
         lb_loss = self.load_balance_loss_fn(scores, topk_idx, self.num_experts, self.num_experts_per_tok)  # fmt: skip
         # Token-weight the injected lb gradient so train_step's 1/num_tokens grad scale leaves it
-        # correctly normalized (it bypasses the token-weighted criterion). lb_loss stays unscaled.
+        # correctly normalized (it bypasses the token-weighted objective). lb_loss stays unscaled.
         topk_weight = MoELoadBalanceLossInjector.apply(topk_weight, lb_loss * topk_weight.shape[0])
         return topk_idx, topk_weight, lb_loss
 
@@ -375,6 +375,7 @@ class GptOssModel(nn.Module):
             case _:
                 raise ValueError("phase must be 0, 1, or -1, got %d" % phase)
         self.stage_index, self.stage_count = stage_index, stage_count
+        self.hidden_size = config.hidden_size
         self.chunk_record: ChunkRecord | None = None
 
         self.rotary_emb = GptOssRotaryEmbedding(config)

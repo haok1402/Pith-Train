@@ -73,7 +73,7 @@ python -m tools.memory_estimator --help   # peak-memory simulator for a given pa
 
 ## Architecture
 
-### DualPipeV Pipeline (`pithtrain/dualpipe/`)
+### DualPipeV Pipeline (`pithtrain/pipeline/`)
 
 The core pipeline assigns each rank two model chunks in a V-shape (the model is cut into `2 * pp_size` chunks; rank `r` holds chunks `r` and `2*pp_size-1-r`) and overlaps forward and backward execution across micro-batches. Each transformer layer is split into 5 stages:
 
@@ -83,13 +83,11 @@ The core pipeline assigns each rank two model chunks in a V-shape (the model is 
 4. **Combine** — All-to-all gather expert outputs (async on comm stream)
 5. **Aggregate** — Weighted expert output + residual connection
 
-Stages 1, 3, and 5 are the layer's compute entry points — `forward_stage1`, `forward_stage3`, `forward_stage5` on `LayerProtocol` (`pithtrain/models/interface.py`); stages 2 and 4 are all-to-all communication driven by the execution machinery (`pithtrain/dualpipe/execution.py`), not layer methods.
+Stages 1, 3, and 5 are the layer's compute entry points — `forward_stage1`, `forward_stage3`, `forward_stage5` on `LayerProtocol` (`pithtrain/models/interface.py`); stages 2 and 4 are all-to-all communication driven by the execution machinery (`pithtrain/pipeline/execution.py`), not layer methods.
 
 Key files:
-- `dualpipev.py` — Main scheduler and P2P between pipeline ranks: `DualPipeV.step()` orchestrates overlapped F/B across modules (supports `forward_only=True` for inference), plus `layer_partition()`, which distributes decoder layers across pipeline stages — edge stages (which hold `embed_tokens` / `norm`+`lm_head`) get fewer layers to balance memory.
-- `overlap.py` — `overlapped_forward_backward()` interleaved loop for one pair of micro-batches
-- `execution.py` — Stage implementations (`stage1_f`, `stage1_b`, etc.), `ExecutionCtx`, and the dispatch/combine helpers
-- `utils.py` — `FP8WeightCacheControl` (cache quantized weights across micro-batches), `WeightGradStore` (deferred wgrad for zero-bubble scheduling)
+- `dualpipev.py` — Main scheduler and P2P between pipeline ranks: `DualPipeV.step()` orchestrates overlapped F/B across modules (supports `forward_only=True` for inference), `overlapped_forward_backward()` is the interleaved loop for one pair of micro-batches, plus `layer_partition()`, which distributes decoder layers across pipeline stages — edge stages (which hold `embed_tokens` / `norm`+`lm_head`) get fewer layers to balance memory.
+- `execution.py` — Stage implementations (`stage1_f`, `stage1_b`, etc.), `ExecutionCtx`, the dispatch/combine helpers, and `WeightGradStore` (deferred wgrad for zero-bubble scheduling)
 
 ### FP8 Training
 
@@ -123,7 +121,7 @@ The pipeline is **BSHD** end to end: hidden states are `(B, S, hidden)` through 
 - **AllToAll** (`all_to_all.py`) — Differentiable collective wrapper
 - **EP Dispatch** (`ep_dispatch.py`) — Fused Triton kernels and orchestration for expert-parallel token dispatch with deduplication
 - **Token Scatter** (`token_scatter.py`) — Triton scatter kernels for grouping tokens by expert ahead of grouped GEMM
-- **FP8 Quantization** (`deepgemm_quantize.py`) — Fused Triton kernels for DeepGEMM-style FP8 quantization
+- **FP8 Quantization** (`deepgemm_quantize.py`) — Fused Triton kernels for DeepGEMM-style FP8 quantization, with `fp8_weight_cache.py` holding the per-step version counter that lets the linear layers reuse a quantized weight across micro-batches
 - **Fused activations / heads** — `silu_mul.py`, `clamped_swiglu.py`, `indexed_bias_add.py`, `cross_entropy.py`
 
 Each operator ships a PyTorch reference impl for correctness testing.

@@ -34,8 +34,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from pithtrain.contexts import distributed, training
-from pithtrain.dualpipe.dualpipev import layer_partition
-from pithtrain.dualpipe.execution import ChunkRecord, record_forward
+from pithtrain.pipeline.dualpipev import layer_partition
+from pithtrain.pipeline.execution import ChunkRecord, model_forward
 from pithtrain.models.interface import RoutingInfo
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.ep_dispatch import prepare_dispatch
@@ -461,7 +461,7 @@ class HFPrefixModel(nn.Module):  # TODO_HF rename: typically `<Prefix>Model`
     def forward(
         self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor | None = None
     ) -> torch.Tensor:
-        return record_forward(self, hidden_states, self.chunk_record, cu_seqlens)
+        return model_forward(self, hidden_states, self.chunk_record, cu_seqlens)
 
     def reference_forward(
         self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor | None = None

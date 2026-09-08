@@ -83,12 +83,11 @@ class ScheduleSimulator:
         self._comm_bytes = activation_est.compute_comm_buffer_bytes()
         self._pp_transfer_bytes = activation_est.compute_pp_transfer_bytes()
 
-        # Num chunks
+        # Num chunks. dp is the only axis that splits the batch; ep shards experts, not data.
         dp_size = parallel_cfg.dp_size
-        ep_size = parallel_cfg.ep_size
         micro_bs = parallel_cfg.micro_batch_size
         global_bs = parallel_cfg.global_batch_size
-        self.num_chunks = global_bs // (micro_bs * dp_size * ep_size)
+        self.num_chunks = global_bs // (micro_bs * dp_size)
 
     def simulate(self) -> ScheduleResult:
         pp_rank = self.pp_rank

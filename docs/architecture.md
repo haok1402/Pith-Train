@@ -83,20 +83,34 @@ See `pithtrain/models/qwen3_moe.py` for a complete, readable implementation of t
 
 V-shaped placement. Instead of one contiguous slice of layers per rank, the model is cut into `2 x pp_size` chunks arranged in a "V": rank `r` holds chunk `r` and chunk `2 x pp_size - 1 - r`. That is why `DualPipeV` is built from a pair of modules, and it is what keeps each rank busy on both the forward and backward sweep (reducing the pipeline bubble). When the layers don't divide evenly across the pipeline, the edge chunks get fewer transformer layers, since they also carry the embeddings and the language-model head.
 
-## 4. Distributed parallelism: the 4D mesh
+## 4. Distributed parallelism: two views of one rank space
 
-`pithtrain/modules/distributed.py` builds a 4D device mesh and is the single source of truth for ranks. Four axes, specified via `DistributedCfg`:
+`pithtrain/modules/distributed.py` is the single source of truth for ranks. It builds **two** device meshes over the same world, so that attention and the experts each get the parallelism they want:
 
 | Axis | Controlled by | What it shards | How it works |
 |---|---|---|---|
 | PP | `pipeline_parallel_size` | model layers | DualPipeV + P2P |
-| EP | `expert_parallel_size` | MoE experts | all-to-all dispatch/combine |
 | CP | `context_parallel_size` | the sequence | ring attention (zigzag layout) |
-| DP | leftover ranks | each batch | [PyTorch FSDP2](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html) |
+| DP | derived | each batch | [PyTorch FSDP2](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html) |
+| EP | `expert_parallel_size` | MoE experts | all-to-all dispatch/combine |
+| DP (expert view) | derived | the expert weights | FSDP2, over the expert replicas |
 
-The mesh axis order is `(PP, DP, CP, EP)`, outer-to-inner. CP and EP sit innermost on purpose: their collectives (ring K/V exchange, MoE all-to-all) are the most frequent, so keeping them in the innermost mesh dimension keeps that traffic inside the NVLink domain as much as possible.
+This is **MoE parallel folding** ([arXiv:2504.14960](https://arxiv.org/abs/2504.14960) section 3.2). One pipeline stage owns `world_size // pp` ranks; the attention view factors that block as `(dp, cp)` and the expert view re-factors the very same block as `(dp, ep)`:
 
-What FSDP shards over. Expert weights are already unique per EP rank, so FSDP shards them only across `dp x cp`. Every other weight (attention, router, embeddings, `norm`, `lm_head`) is replicated across EP, so FSDP shards it across `dp x cp x ep`, i.e. over the EP dimension as well. (`sharding_strategy="fsdp"`, the default, is the case above; `"hsdp"` instead replicates across DP and shards within `cp x ep`, for when one DP replica already fits.) The per-parameter-class mesh selection is in `apply_fsdp` in `pithtrain/modules/training.py`.
+```
+attn_mesh:  rank = pp_rank * stage  +  dp_rank * cp  +  cp_rank
+expt_mesh:  rank = pp_rank * stage  +  dp_rank * ep  +  ep_rank
+```
+
+so `dp * cp == ep * expt_dp == world_size // pp`. PP is the one axis the two views share, and it stays outermost in each, which is the whole correctness argument: every rank agrees with itself about the pipeline stage it holds, so the attention half and the expert half of a layer live on the same device. `cp` and `ep` each need only divide the stage size, not each other, so EP may span CP and `ep` ranges over any divisor of `world_size // pp`.
+
+Each view puts its high-traffic axis innermost, so the CP group and the EP group are *both* contiguous rank blocks. They are two labellings of the same rank index, so neither costs the other anything: keeping `cp` and `ep` each within a node keeps the ring K/V exchange and the MoE all-to-all on NVLink, independently of one another.
+
+Which rank reads which data is `dp_rank`, and only `dp_rank`. `ep_rank` names the experts a rank hosts and the all-to-all peers of that rank, and says nothing about data. The transition between the two regions costs no communication: the MoE layer flattens `(B, S, hidden)` into a batch of tokens and routes each one independently, so it does not care whether the tokens on a rank arrived by a batch split (DP) or a sequence split (CP).
+
+What FSDP shards over. There are two parameter classes. The **expt** parameters are the routed expert weights, unique per EP rank and replicated across the `dp` axis of the expert view, so FSDP shards them over that axis. The **attn** parameters are everything else (attention, router, shared experts, embeddings, `norm`, `lm_head`), replicated across the whole stage, so FSDP shards them over the flattened `dp x cp`. That is two `fully_shard` calls per layer, and the FSDP2 module walk stops at an already-sharded submodule, so the two parameter classes land in disjoint reduction groups. (That is `hsdp_replica=1`, the default. Above 1, both replica groups split into that many replicas, and FSDP shards within one and all-reduces across them; raise it when one replica already holds the model.) The per-parameter-class mesh selection is in `apply_fsdp` in `pithtrain/modules/training.py`.
+
+Gradients. The two classes reduce over groups of different size, yet either *sum* is already the true global gradient. The attn group is the whole stage. The expert replica group covers all the data too, because every member already receives the tokens of a whole EP group through the all-to-all. So `apply_fsdp` puts every parameter on a plain-sum reduction (`set_gradient_divide_factor(1.0)`), and the training step applies the one and only normalization, dividing by the global token count. An average, which is the FSDP2 default, would instead leave expert gradients `ep_size` times too large.
 
 ## 5. FP8 training
 

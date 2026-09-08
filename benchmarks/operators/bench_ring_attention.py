@@ -29,7 +29,7 @@ def run(scenario: str, config: dict, cp_size: int, S: int) -> None:
     HQ, HK = config["num_attention_heads"], config["num_key_value_heads"]
     D = config["head_dim"]
 
-    cp_group = distributed.device_mesh.get_group("cp")
+    cp_group = distributed.cp_group
     device = torch.cuda.current_device()
     softmax_scale = D**-0.5
     S_local = S // cp_size

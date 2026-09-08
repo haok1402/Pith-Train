@@ -21,7 +21,7 @@ So a base-vs-feature delta means nothing on its own. `base0` and `base1` are ide
 
 - Activate `.venv` in the repo root: `source .venv/bin/activate`.
 - A tokenized corpus for the model — run **setup-benchmark-inputs** if `workspace/datasets/dclm-baseline/toktxt/<tokenizer>` is missing. No checkpoint is needed; runs start from fresh weights.
-- `world_size >= PP * CP * EP` with `DP >= 1`.
+- `world_size % PP == 0` with `CP` and `EP` each dividing `world_size / PP`.
 - **A clean tree.** The arms are switched with `git checkout`, so commit the feature work first — pushed or not. Uncommitted changes either follow you onto the base branch or block the checkout.
 
 Runs must be **strictly sequential**, since one tree serves both arms. Never queue all three and let the scheduler interleave them: a checkout landing while a run is pending or in flight silently executes the wrong branch. Each run must finish before the next starts.
@@ -114,7 +114,7 @@ The step-1 row is reported, not gated. It precedes any optimizer update, so its 
 
 `max_steps * global_batch_size` must not exceed the corpus sample count, which scales inversely with sequence length — one tokenized DCLM shard yields ~18,000 samples at 4096 and roughly twice that at 2048. A run that does not fit raises at startup, but only after the JIT warmup.
 
-`sequence_length % (2 * cp_size) == 0` for the zigzag split, and `global_batch / (dp * ep) >= 2 * pp`.
+`sequence_length % (2 * cp_size) == 0` for the zigzag split, and `global_batch / dp >= 2 * pp` (where `dp = world_size / (pp * cp)`).
 
 Keep sequence length and global batch identical across meshes, so meshes stay comparable to each other and not only within themselves.
 

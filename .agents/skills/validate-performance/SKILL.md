@@ -17,7 +17,7 @@ The wandb run is grouped as `performance/<model>`, so several meshes for one mod
 
 - Activate `.venv` in the repo root: `source .venv/bin/activate`.
 - A tokenized corpus for the model — run **setup-benchmark-inputs** if `workspace/datasets/dclm-baseline/toktxt/<tokenizer>` is missing. No checkpoint is needed.
-- `world_size >= PP * CP * EP` with `DP >= 1`, `sequence_length % (2 * cp_size) == 0`, and `global_batch / (dp * ep) >= 2 * pp`.
+- `world_size % PP == 0` with `CP` and `EP` each dividing `world_size / PP`, `sequence_length % (2 * cp_size) == 0`, and `global_batch / dp >= 2 * pp` (where `dp = world_size / (pp * cp)`).
 - Keep sequence length, dtype and global batch identical across the two arms, and across meshes you intend to compare to each other.
 - **A clean tree.** The arms are switched with `git checkout`, so commit the feature work first.
 

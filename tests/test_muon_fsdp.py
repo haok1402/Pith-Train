@@ -10,8 +10,8 @@ Run (expert-parallel; experts and dense weights land on different meshes)::
 
     torchrun --nproc-per-node=8 tests/test_muon_fsdp.py --ep-size 2
 
-Mirrors ``apply_fsdp``: experts shard on the ``(dp, cp)`` mesh, everything else
-on the flattened ``(dp, cp, ep)`` mesh. Injects identical grads into (a) an
+Mirrors apply_fsdp: experts shard on the dp mesh of the expert view, everything else on the
+flattened (dp, cp) mesh of the attention view. Injects identical grads into (a) an
 unsharded reference holding this EP rank's slice and (b) the FSDP-sharded model,
 steps both with ``[Muon, AdamW]``, and asserts the sharded update matches the
 reference. fp32 params, so any mismatch is plumbing, not bf16 NS noise (the
@@ -27,7 +27,8 @@ from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor, Replicate
 from torch.optim import AdamW
 
-from pithtrain.modules.distributed import DistributedCfg, DistributedCtx, distributed_context
+from pithtrain.contexts import distributed
+from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.modules.optimizer import Muon
 from pithtrain.modules.training import is_muon_param
 from pithtrain.operators.grouped_linear import GroupedLinear
@@ -62,14 +63,13 @@ class _Model(nn.Module):
         nn.init.normal_(self.experts.weight, std=0.02)
 
 
-def main(ctx: DistributedCtx):
-    mesh = ctx.device_mesh
-    ep_size, ep_rank = ctx.ep_size, ctx.ep_rank
-    # Same split as training.apply_fsdp: experts on (dp, cp), the rest on the
-    # flattened (dp, cp, ep) mesh. At ep=cp=1 both collapse to pure dp.
-    moe_mesh = mesh["dp", "cp"]._flatten()
-    other_mesh = mesh["dp", "cp", "ep"]._flatten()
-    device = torch.device("cuda", ctx.local_rank)
+def main():
+    ep_size, ep_rank = distributed.ep_size, distributed.ep_rank
+    # Same split as training.apply_fsdp: experts on the dp axis of the expert view, the rest on
+    # the flattened dp x cp attention mesh. At ep=cp=1 both collapse to pure dp.
+    expt_fsdp_mesh = distributed.expt_mesh["dp"]
+    attn_fsdp_mesh = distributed.attn_mesh["dp", "cp"]._flatten()
+    device = torch.device("cuda", distributed.local_rank)
     lr = 0.1
 
     # Full weights + grads, identical on every rank (same seed).
@@ -101,11 +101,11 @@ def main(ctx: DistributedCtx):
     with torch.no_grad():
         for n, p in shd.named_parameters():
             p.copy_(ep_slice(n, full_state[n]))
-    fully_shard(shd.experts, mesh=moe_mesh)
-    fully_shard(shd.q_proj, mesh=other_mesh)
-    fully_shard(shd.norm, mesh=other_mesh)
-    fully_shard(shd.embed_tokens, mesh=other_mesh)
-    fully_shard(shd, mesh=other_mesh)
+    fully_shard(shd.experts, mesh=expt_fsdp_mesh)
+    fully_shard(shd.q_proj, mesh=attn_fsdp_mesh)
+    fully_shard(shd.norm, mesh=attn_fsdp_mesh)
+    fully_shard(shd.embed_tokens, mesh=attn_fsdp_mesh)
+    fully_shard(shd, mesh=attn_fsdp_mesh)
 
     for n, p in shd.named_parameters():
         g = ep_slice(n, full_grads[n])
@@ -123,10 +123,10 @@ def main(ctx: DistributedCtx):
             max_diff, worst = diff, n
         assert torch.allclose(full_p, ref_after[n], atol=1e-3, rtol=1e-3), (n, diff)
 
-    if ctx.rank == 0:
+    if distributed.rank == 0:
         print(
             f"[INFO] Muon FSDP step matches single-process reference "
-            f"(dp={ctx.dp_size} cp={ctx.cp_size} ep={ep_size}). "
+            f"(dp={distributed.dp_size} cp={distributed.cp_size} ep={ep_size}). "
             f"max|diff|={max_diff:.2e} (worst param: {worst})",
             flush=True,
         )
@@ -139,11 +139,10 @@ if __name__ == "__main__":
     parser.add_argument("--cp-size", type=int, default=1)
     parsed = parser.parse_args()
 
-    cfg, ctx = SimpleNamespace(), SimpleNamespace()
+    cfg = SimpleNamespace()
     cfg.distributed = DistributedCfg()
     cfg.distributed.pipeline_parallel_size = 1
     cfg.distributed.expert_parallel_size = parsed.ep_size
     cfg.distributed.context_parallel_size = parsed.cp_size
-    ctx.distributed = DistributedCtx()
-    with distributed_context(cfg, ctx):
-        main(ctx.distributed)
+    setup_distributed(cfg)
+    main()

@@ -6,7 +6,6 @@ import sys
 import threading
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Literal
 
 import torch
 
@@ -55,14 +54,15 @@ class DistributedCfg(SlottedDefault):
     small to fail fast.
     """
 
-    sharding_strategy: Literal["fsdp", "hsdp"] = "fsdp"
+    hsdp_replica: int = 1
     """
-    FSDP2 sharding strategy.
+    Number of replicas each FSDP shard group is split into.
 
-    - "fsdp": shard parameters across the full FSDP mesh (dp x cp x ep for non-MoE; dp x cp
-      for MoE experts). Lowest memory.
-    - "hsdp": shard within the inner mesh (cp x ep for non-MoE; cp for MoE) and replicate
-      across dp. Pick when one DP replica fits the model.
+    At 1, FSDP shards every parameter across the whole replica group for its class: the dp x cp
+    stage for the attn parameters, the dp axis of the expert view for the expt parameters. Above
+    1, both of those groups split into this many replicas, so both must divide by it, and FSDP
+    shards within one replica and all-reduces across them. Raise it when one replica already
+    holds the model, trading memory for a cheaper gradient reduction.
     """
 
 
@@ -128,37 +128,53 @@ def setup_failfast_excepthook() -> None:
 
 def setup_device_mesh(cfg: DistributedCfg) -> None:
     """
-    Build the (PP, DP, CP, EP) device mesh and publish per-axis groups, ranks, and sizes.
+    Build the attention and expert views of the rank space and publish per-axis groups.
 
-    Mesh dimensions go outer-to-inner: PP, DP, CP, EP. CP and EP sit innermost so frequent
-    collectives (ring K/V exchange, MoE all-to-all) stay within the NVLink domain.
+    MoE parallel folding (https://arxiv.org/abs/2504.14960 section 3.2): attention and the
+    experts factor the same block of world_size // pp_size ranks two different ways, dp x cp for
+    attention and dp x ep for the experts. PP is the one shared axis and stays outermost, so a
+    rank agrees with itself about which pipeline stage it holds. Each view puts its high-traffic
+    axis innermost, so the ring K/V exchange and the MoE all-to-all each run over a contiguous
+    rank block and stay inside the NVLink domain independently of one another.
+
+    So cp_size and ep_size each need only divide the stage size, not each other, and ep_rank says
+    only which experts a rank hosts: which data a rank loads is dp_rank alone.
     """
     pp_size = cfg.pipeline_parallel_size
     cp_size = cfg.context_parallel_size
     ep_size = cfg.expert_parallel_size
 
-    world_size, divisor = distributed.world_size, pp_size * cp_size * ep_size
-    if world_size % divisor != 0:
-        raise RuntimeError(f"{world_size=} not divisible by {pp_size=} * {cp_size=} * {ep_size=}")
-    dp_size = world_size // divisor
+    world_size = distributed.world_size
+    if world_size % pp_size != 0:
+        raise RuntimeError(f"{world_size=} not divisible by {pp_size=}")
+    stage_size = world_size // pp_size
+    if stage_size % cp_size != 0:
+        raise RuntimeError(f"{stage_size=} (world_size // pp_size) not divisible by {cp_size=}")
+    if stage_size % ep_size != 0:
+        raise RuntimeError(f"{stage_size=} (world_size // pp_size) not divisible by {ep_size=}")
+    attn_dp_size = stage_size // cp_size
+    expt_dp_size = stage_size // ep_size
 
-    kwargs = dict()
-    kwargs["device_type"] = "cuda"
-    kwargs["mesh_shape"] = (pp_size, dp_size, cp_size, ep_size)
-    kwargs["mesh_dim_names"] = ("pp", "dp", "cp", "ep")
-    distributed.device_mesh = torch.distributed.init_device_mesh(**kwargs)
+    # Both views carry pp, so the pp communicator is built twice, at the cost of one extra
+    # ncclCommSplit. Only the pp group on attn_mesh is ever read.
+    init = torch.distributed.init_device_mesh
+    attn_mesh = init("cuda", (pp_size, attn_dp_size, cp_size), mesh_dim_names=("pp", "dp", "cp"))
+    expt_mesh = init("cuda", (pp_size, expt_dp_size, ep_size), mesh_dim_names=("pp", "dp", "ep"))
+    distributed.attn_mesh, distributed.expt_mesh = attn_mesh, expt_mesh
 
-    distributed.pp_size, distributed.pp_rank = pp_size, distributed.device_mesh.get_local_rank("pp")
-    distributed.pp_group = distributed.device_mesh.get_group("pp")
+    distributed.pp_size, distributed.pp_rank = pp_size, attn_mesh.get_local_rank("pp")
+    distributed.pp_group = attn_mesh.get_group("pp")
 
-    distributed.dp_size, distributed.dp_rank = dp_size, distributed.device_mesh.get_local_rank("dp")
-    distributed.dp_group = distributed.device_mesh.get_group("dp")
+    distributed.cp_size, distributed.cp_rank = cp_size, attn_mesh.get_local_rank("cp")
+    distributed.cp_group = attn_mesh.get_group("cp")
 
-    distributed.cp_size, distributed.cp_rank = cp_size, distributed.device_mesh.get_local_rank("cp")
-    distributed.cp_group = distributed.device_mesh.get_group("cp")
+    distributed.ep_size, distributed.ep_rank = ep_size, expt_mesh.get_local_rank("ep")
+    distributed.ep_group = expt_mesh.get_group("ep")
 
-    distributed.ep_size, distributed.ep_rank = ep_size, distributed.device_mesh.get_local_rank("ep")
-    distributed.ep_group = distributed.device_mesh.get_group("ep")
+    # Neither dp axis gets a process group: no collective runs over them directly, and FSDP
+    # reduces there off a DeviceMesh, which the two views already provide. Only the attention dp
+    # is published, since that is what decides which data a rank loads.
+    distributed.dp_size, distributed.dp_rank = attn_dp_size, attn_mesh.get_local_rank("dp")
 
 
 def setup_distributed(cfg: object) -> None:

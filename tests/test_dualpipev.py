@@ -14,7 +14,7 @@ import torch.distributed.fsdp
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.elastic.multiprocessing.errors import record
-from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
 from transformers import AutoConfig
 
 from pithtrain.contexts import distributed, training
@@ -83,6 +83,22 @@ def reference_step(chunks, model: DeepSeekV2Model):
     return torch.stack(ls), ys
 
 
+def zigzag_shard(x: torch.Tensor, cp_rank: int, cp_size: int) -> torch.Tensor:
+    """
+    Take the zigzag half-pair for this CP rank along dim 1.
+
+    The sequence is cut into 2 * cp_size equal blocks and rank r keeps blocks r and
+    2 * cp_size - r - 1, balancing the causal workload. Same layout as get_global_batch in
+    tasks/pretrain_lm.py and forward_posemb in each model.
+    """
+    if cp_size == 1:
+        return x
+    block = x.shape[1] // (2 * cp_size)
+    front = cp_rank * block
+    back = (2 * cp_size - cp_rank - 1) * block
+    return torch.cat([x[:, front : front + block], x[:, back : back + block]], dim=1)
+
+
 def shard_layers(layers: nn.ModuleDict, stage_id: int, num_stages: int, config):
     num_local_layers = [config.num_hidden_layers // num_stages for _ in range(num_stages)]
     layers_per_stage_residual = config.num_hidden_layers % num_stages
@@ -130,11 +146,11 @@ def shard_experts(model, ep_rank, ep_size):
             shard_experts(child, ep_rank, ep_size)
 
 
-def apply_fsdp(model, mesh: torch.distributed.DeviceMesh, dtype):
-    # MoE params are sharded by EP, we only additionally shard on the DP dimension
-    moe_fsdp_mesh = mesh["dp"]
-    # For other params, we shard on the both DP and EP dimensions
-    other_fsdp_mesh = mesh["dp", "ep"]._flatten()
+def apply_fsdp(model, dtype):
+    # Mirrors modules.training.apply_fsdp: the expt parameters replicate over the dp axis of the
+    # expert view, the attn parameters over the flattened dp x cp stage of the attention view.
+    expt_fsdp_mesh = distributed.expt_mesh["dp"]
+    attn_fsdp_mesh = distributed.attn_mesh["dp", "cp"]._flatten()
     mp = MixedPrecisionPolicy(
         param_dtype=dtype,
         reduce_dtype=torch.float32,
@@ -146,28 +162,36 @@ def apply_fsdp(model, mesh: torch.distributed.DeviceMesh, dtype):
         if model[i].embed_tokens is not None:
             fully_shard(
                 model[i].embed_tokens,
-                mesh=other_fsdp_mesh,
+                mesh=attn_fsdp_mesh,
                 reshard_after_forward=True,
                 mp_policy=mp,
             )
         if model[i].norm is not None:
             assert model[i].lm_head is not None
             fully_shard(
-                model[i].norm, mesh=other_fsdp_mesh, reshard_after_forward=True, mp_policy=mp
+                model[i].norm, mesh=attn_fsdp_mesh, reshard_after_forward=True, mp_policy=mp
             )
             fully_shard(
-                model[i].lm_head, mesh=other_fsdp_mesh, reshard_after_forward=True, mp_policy=mp
+                model[i].lm_head, mesh=attn_fsdp_mesh, reshard_after_forward=True, mp_policy=mp
             )
         for layer in model[i].layers.values():
             if hasattr(layer.mlp, "experts"):
                 fully_shard(
-                    layer.mlp.experts, mesh=moe_fsdp_mesh, reshard_after_forward=False, mp_policy=mp
+                    layer.mlp.experts,
+                    mesh=expt_fsdp_mesh,
+                    reshard_after_forward=False,
+                    mp_policy=mp,
                 )
-            fully_shard(layer, mesh=other_fsdp_mesh, reshard_after_forward=False, mp_policy=mp)
+            fully_shard(layer, mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp)
             torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage1")
             torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage3")
             torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage5")
-        fully_shard(model[i], mesh=other_fsdp_mesh, reshard_after_forward=False, mp_policy=mp)
+        fully_shard(model[i], mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp)
+    # Plain-sum reduction, as in modules.training.apply_fsdp. Both classes then hold the
+    # gradient summed over their own replica group, which equals the reference gradient.
+    for module in model.modules():
+        if isinstance(module, FSDPModule):
+            module.set_gradient_divide_factor(1.0)
     return model
 
 
@@ -181,14 +205,15 @@ def main(model_name: str):
         Model name or local config path.
     """
 
-    ep_group = distributed.ep_group
     dp_size, pp_size, ep_size = distributed.dp_size, distributed.pp_size, distributed.ep_size
-    pp_rank, ep_rank = distributed.pp_rank, distributed.ep_rank
+    cp_size, cp_rank = distributed.cp_size, distributed.cp_rank
+    pp_rank, dp_rank, ep_rank = distributed.pp_rank, distributed.dp_rank, distributed.ep_rank
 
     if distributed.rank == 0:
         print("[INFO] Testing FSDP x DualPipeV x EP with model: %s" % model_name, flush=True)
         print(
-            "[INFO] DP size: %d, PP size: %d, EP size: %d." % (dp_size, pp_size, ep_size),
+            "[INFO] DP size: %d, PP size: %d, EP size: %d, CP size: %d."
+            % (dp_size, pp_size, ep_size, cp_size),
             flush=True,
         )
     torch.distributed.barrier()
@@ -204,6 +229,7 @@ def main(model_name: str):
 
     packed = os.environ.get("PACKED_SEQLEN", "0") == "1"
     ragged = os.environ.get("RAGGED_MICROBATCH", "0") == "1"
+    assert not (packed and cp_size > 1), "CP with packed cu_seqlens is not supported yet."
     micro_batch_size = 1 if packed else 3  # packing pins mbs to 1
     num_chunks, sequence_length = 20, 128
 
@@ -239,12 +265,13 @@ def main(model_name: str):
 
     vocab_size = config.vocab_size
 
-    # Build the micro-batches, one entry per global chunk, ordered expert-parallel-major so
-    # rank r owns chunks [r * num_chunks, (r + 1) * num_chunks).
+    # Build the micro-batches, one entry per global chunk, ordered data-parallel-major so dp rank
+    # r owns chunks [r * num_chunks, (r + 1) * num_chunks). dp alone splits the data: the expert
+    # rank says which experts a rank hosts, never which data it sees.
     #
     # Two steps are run, so the shapes agreed for one step cannot leak into the next: under
     # ragged the second step uses different sequence lengths than the first.
-    num_global_chunks = ep_size * num_chunks
+    num_global_chunks = dp_size * num_chunks
     label_scale = 10.0  # scaled up so MSE grads on small bias terms clear the bf16 noise floor
 
     def build_chunks(step_index):
@@ -280,8 +307,11 @@ def main(model_name: str):
 
     chunk_steps = [build_chunks(0), build_chunks(1)]
 
-    # Reference runs single-device (pp=ep=1); restore the real mesh before DualPipeV.
-    distributed.pp_size = distributed.ep_size = 1
+    # Reference runs single-device and full-sequence (pp=ep=cp=1); restore before DualPipeV.
+    # cp_rank must be forced too: forward_posemb reads it unguarded to build the zigzag position
+    # ids, so a nonzero cp_rank gives the reference the wrong slice of the RoPE table.
+    distributed.pp_size = distributed.ep_size = distributed.cp_size = 1
+    distributed.cp_rank = 0
     full_modules = ModelClass(config, phase=-1)
     full_modules.to(dtype=dtype)
     full_modules.apply(fill_weights)
@@ -293,6 +323,7 @@ def main(model_name: str):
 
     loss_refs = [reference_step(chunks, full_modules)[0] for chunks in chunk_steps]
     distributed.pp_size, distributed.ep_size = pp_size, ep_size
+    distributed.cp_size, distributed.cp_rank = cp_size, cp_rank
 
     if distributed.rank == 0:
         print("[INFO] Completed the reference step.", flush=True)
@@ -329,7 +360,7 @@ def main(model_name: str):
     local_modules[0].load_state_dict(local_full_modules[0].state_dict())
     local_modules[1].load_state_dict(local_full_modules[1].state_dict())
     local_modules.zero_grad()
-    apply_fsdp(local_modules, distributed.device_mesh, dtype)
+    apply_fsdp(local_modules, dtype)
 
     # Wrap the modules with DualPipeV.
     dualpipev_model = DualPipeV(local_modules)
@@ -338,9 +369,14 @@ def main(model_name: str):
     for step_index, chunks in enumerate(chunk_steps):
         # Every pipeline rank builds the same micro-batches, so each derives its own P2P
         # shapes; only the first rank reads the tensors.
-        local_chunks = chunks[ep_rank * num_chunks : (ep_rank + 1) * num_chunks]
+        # dp picks the samples, then cp picks the zigzag slice this rank takes from each one.
+        local_chunks = chunks[dp_rank * num_chunks : (dp_rank + 1) * num_chunks]
         microbatches = [
-            Microbatch(model_inputs=(x,), cu_seqlens=cu, objective_inputs=(lab,))
+            Microbatch(
+                model_inputs=(zigzag_shard(x, cp_rank, cp_size),),
+                cu_seqlens=cu,
+                objective_inputs=(zigzag_shard(lab, cp_rank, cp_size),),
+            )
             for x, lab, cu in local_chunks
         ]
 
@@ -357,7 +393,12 @@ def main(model_name: str):
         # Validate the loss.
         if pp_rank == 0:
             loss = torch.stack(objective_outputs)
-            loss_ref = loss_refs[step_index].reshape(ep_size, -1)[ep_rank]
+            if cp_size > 1:
+                # Every rank takes the mean over its own S/cp tokens, so the mean over the
+                # whole sequence is the average of those.
+                torch.distributed.all_reduce(loss, group=distributed.cp_group)
+                loss = loss / cp_size
+            loss_ref = loss_refs[step_index].reshape(dp_size, -1)[dp_rank]
             print(
                 "[INFO] rank-%d, step %d, loss: %s, loss_ref: %s"
                 % (distributed.rank, step_index, loss, loss_ref),
@@ -384,12 +425,18 @@ def main(model_name: str):
                 % (distributed.rank, n)
             )
             continue
+        # Both parameter classes reduce with a plain sum over their own replica group, and either
+        # sum spans every global chunk exactly once: the attn group is the whole dp x cp stage,
+        # and the expt replica group covers all the data too, since every member receives the
+        # tokens of a whole EP group through the all-to-all. A mismatch here points at the mesh
+        # or at the gradient divide factor.
         p_grad = p.grad
         if isinstance(p_grad, torch.distributed.tensor.DTensor):
             p_grad = p_grad.full_tensor()
-        if ".experts." not in n and ep_size > 1:
-            p_grad = p_grad.clone()
-            torch.distributed.all_reduce(p_grad, group=ep_group)
+        if cp_size > 1:
+            # Each CP rank takes a mean over S/cp tokens, which is cp times its share of the
+            # full-sequence mean, so the summed gradient overshoots the reference by exactly cp.
+            p_grad = p_grad / cp_size
         if torch.all(p_grad == 0) and torch.all(p_ref.grad == 0):
             print(
                 "[warn] rank-%d, Parameter %s has all-zero gradient, skipping."
@@ -397,9 +444,11 @@ def main(model_name: str):
             )
             continue
         # Reference accumulates in bf16, DualPipeV in fp32; cosine-diff on
-        # noise-floor grads (e.g. gpt-oss router.bias ~1e-8) is meaningless.
+        # noise-floor grads (e.g. gpt-oss router.bias ~1e-8) is meaningless. Routed expert
+        # weights are exempt: their gradients scale as 1/num_experts, so a fixed floor drops
+        # every one of them on a many-expert config and leaves the expert path unchecked.
         ref_max = p_ref.grad.abs().max().item()
-        if ref_max < 1e-5:
+        if ref_max < 1e-5 and ".experts." not in n:
             print(
                 "[warn] rank-%d, Parameter %s grad max=%.2e at bf16 noise floor, skipping."
                 % (distributed.rank, n, ref_max)
@@ -454,6 +503,7 @@ def _entry() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pp-size", type=int, required=True)
     parser.add_argument("--ep-size", type=int, required=True)
+    parser.add_argument("--cp-size", type=int, default=1)
     parser.add_argument("--model", type=str, choices=models, required=True)
     parsed = parser.parse_args()
 
@@ -461,6 +511,7 @@ def _entry() -> None:
     cfg.distributed = DistributedCfg()
     cfg.distributed.pipeline_parallel_size = parsed.pp_size
     cfg.distributed.expert_parallel_size = parsed.ep_size
+    cfg.distributed.context_parallel_size = parsed.cp_size
 
     setup_distributed(cfg)
     main(parsed.model)

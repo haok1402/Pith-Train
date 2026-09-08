@@ -53,16 +53,13 @@ def estimate_non_pytorch_bytes(parallel_cfg: ParallelismConfig) -> int:
     # Phase 2: NCCL world process group
     nccl_world = int(0.39 * GiB)
 
-    # Phase 3: Device mesh process groups (pp, ep, dp dimensions)
-    # Measured: 1.00 GiB for pp=4, ep=8, dp=1 (2 active mesh dims).
-    # Scale by number of active mesh dimensions.
-    num_mesh_dims = sum(
-        [
-            parallel_cfg.pp_size > 1,
-            parallel_cfg.ep_size > 1,
-            parallel_cfg.dp_size > 1,
-        ]
-    )
+    # Phase 3: Device mesh process groups, ~0.4 GiB of NCCL buffers per non-trivial dimension.
+    # Measured: 1.00 GiB for pp=4, ep=8, dp=1 (2 active mesh dims). The attention (pp, dp, cp)
+    # and expert (pp, dp, ep) meshes cover the same ranks, so pp contributes a communicator to
+    # each. NCCL buffers live outside the caching allocator, so nothing else here counts them.
+    attention_dims = [parallel_cfg.pp_size, parallel_cfg.dp_size, parallel_cfg.cp_size]
+    expert_dims = [parallel_cfg.pp_size, parallel_cfg.expt_dp_size, parallel_cfg.ep_size]
+    num_mesh_dims = sum(size > 1 for size in attention_dims + expert_dims)
     nccl_mesh = int(num_mesh_dims * 0.4 * GiB)
     # PP requires additional send/recv groups
     if parallel_cfg.pp_size > 1:
@@ -129,15 +126,17 @@ def run_estimate(
     ep = parallel_cfg.ep_size
     dp = parallel_cfg.dp_size
     cp = parallel_cfg.cp_size
-    total_gpus = pp * ep * dp * cp
+    total_gpus = pp * dp * cp
+    expt_dp = parallel_cfg.expt_dp_size
     parallel_desc = (
-        f"Parallelism: pp={pp}, ep={ep}, dp={dp}, cp={cp} | {total_gpus} GPUs | pp_rank={pp_rank}"
+        f"Parallelism: pp={pp} | attn dp={dp} cp={cp} | expt dp={expt_dp} ep={ep} | "
+        f"{total_gpus} GPUs | pp_rank={pp_rank}"
     )
 
     mbs = parallel_cfg.micro_batch_size
     gbs = parallel_cfg.global_batch_size
     seq = parallel_cfg.sequence_length
-    num_chunks = gbs // (mbs * dp * ep)
+    num_chunks = gbs // (mbs * dp)
     training_desc = (
         f"Training: micro_bs={mbs}, global_bs={gbs}, seq_len={seq}, num_chunks={num_chunks}"
     )
@@ -217,15 +216,23 @@ def main():
     # Load model config
     model_cfg = ModelConfig.from_json(args.model)
 
-    # Compute dp_size
-    dp_size = args.total_gpus // (args.pp_size * args.cp_size * args.ep_size)
-    if dp_size * args.pp_size * args.cp_size * args.ep_size != args.total_gpus:
+    # cp and ep each factor the stage independently: attention sees dp x cp and the experts see
+    # dp x ep, over the same world // pp ranks.
+    if args.total_gpus % args.pp_size != 0:
         print(
-            f"Error: total_gpus ({args.total_gpus}) must be divisible by "
-            f"pp_size * cp_size * ep_size ({args.pp_size * args.cp_size * args.ep_size})",
+            f"Error: total_gpus ({args.total_gpus}) must be divisible by pp_size ({args.pp_size})",
             file=sys.stderr,
         )
         sys.exit(1)
+    stage_size = args.total_gpus // args.pp_size
+    for name, size in (("cp_size", args.cp_size), ("ep_size", args.ep_size)):
+        if stage_size % size != 0:
+            print(
+                f"Error: total_gpus // pp_size ({stage_size}) must be divisible by {name} ({size})",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    dp_size = stage_size // args.cp_size
 
     parallel_cfg = ParallelismConfig(
         pp_size=args.pp_size,
@@ -238,12 +245,12 @@ def main():
         fp8_training=args.fp8_training,
     )
 
-    # Validate num_chunks
-    chunk_divisor = args.micro_batch_size * dp_size * args.ep_size
+    # Validate num_chunks. dp alone splits the batch; ep shards experts, not data.
+    chunk_divisor = args.micro_batch_size * dp_size
     if args.global_batch_size % chunk_divisor != 0:
         print(
             f"Error: global_batch_size ({args.global_batch_size}) must be divisible by "
-            f"micro_batch_size * dp_size * ep_size ({chunk_divisor})",
+            f"micro_batch_size * dp_size ({chunk_divisor})",
             file=sys.stderr,
         )
         sys.exit(1)

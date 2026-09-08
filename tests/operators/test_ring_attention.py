@@ -50,7 +50,7 @@ def record(req: Request) -> tuple[Result, Result]:
     ring_attention_func run on this rank's zigzag-local slice of Q/K/V with K/V
     rotated around the CP ring during the forward and backward passes.
     """
-    cp_group = distributed.device_mesh.get_group("cp")
+    cp_group = distributed.cp_group
     cp_rank, cp_size = cp_group.rank(), cp_group.size()
     device = torch.cuda.current_device()
     softmax_scale = req.D**-0.5
@@ -142,7 +142,7 @@ def record_mla(req: MLARequest):
     gradients (dq_nope, dq_pe, d_normed_kv, d_k_pe) on this rank's zigzag slice, plus the
     kv_b weight gradient -- which is global, so the per-rank partials are summed across CP.
     """
-    cp_group = distributed.device_mesh.get_group("cp")
+    cp_group = distributed.cp_group
     cp_rank, cp_size = cp_group.rank(), cp_group.size()
     device = torch.cuda.current_device()
     H, R = req.H, req.kv_lora_rank
@@ -258,7 +258,7 @@ def record_mla_fp8(req: MLARequest):
     """
     from pithtrain.operators.linear import FP8Linear
 
-    cp_group = distributed.device_mesh.get_group("cp")
+    cp_group = distributed.cp_group
     cp_rank, cp_size = cp_group.rank(), cp_group.size()
     device = torch.cuda.current_device()
     H, R = req.H, req.kv_lora_rank

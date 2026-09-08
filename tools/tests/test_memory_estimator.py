@@ -34,7 +34,7 @@ def _qwen3_parallel_cfg():
     return ParallelismConfig(
         pp_size=4,
         ep_size=8,
-        dp_size=1,
+        dp_size=8,
         cp_size=1,
         micro_batch_size=1,
         global_batch_size=1024,
@@ -270,7 +270,7 @@ class TestDeepSeekV2Lite:
         parallel_cfg = ParallelismConfig(
             pp_size=2,
             ep_size=2,
-            dp_size=1,
+            dp_size=2,
             cp_size=1,
             micro_batch_size=1,
             global_batch_size=1024,

@@ -13,7 +13,7 @@ import torch
 import torch.distributed.fsdp
 import torch.nn as nn
 from torch.distributed import DeviceMesh
-from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
 from torch.optim import AdamW, Optimizer
 from torch.optim.lr_scheduler import LambdaLR, LRScheduler
 from transformers import AutoConfig
@@ -325,27 +325,34 @@ def init_weights(model: nn.Module, num_layers: int, init_std: float = 0.02) -> N
             torch.nn.init.normal_(param, mean=0.0, std=init_std)
 
 
-def apply_fsdp(
-    model,
-    mesh: DeviceMesh,
-    sharding_strategy: Literal["fsdp", "hsdp"] = "fsdp",
-):
-    # MoE params: unique per EP rank, replicated across DP x CP.
-    # Non-MoE params: replicated across DP x CP x EP.
-    # FSDP shards along the replicated dims:
-    #   "fsdp": 1D mesh; FSDP2 shards across all participants.
-    #   "hsdp": 2D mesh; FSDP2 shards along the inner dim and replicates
-    #           along the outer (dp) dim. For non-MoE, cp and ep are folded
-    #           into a single inner shard dim via _concatenate.
-    if sharding_strategy == "fsdp":
-        moe_fsdp_mesh = mesh["dp", "cp"]._flatten()
-        other_fsdp_mesh = mesh["dp", "cp", "ep"]._flatten()
-    elif sharding_strategy == "hsdp":
-        moe_fsdp_mesh = mesh["dp", "cp"]
-        cp_ep_mesh = mesh["cp", "ep"]._flatten("cp_ep")
-        other_fsdp_mesh = DeviceMesh._concatenate([mesh["dp"], cp_ep_mesh])
+def split_replicas(mesh: DeviceMesh, hsdp_replica: int) -> DeviceMesh:
+    """
+    Split a replica group into hsdp_replica replicas, giving FSDP a mesh to shard within one.
+
+    FSDP2 reads a 2-D mesh as (replicate, shard), so the replica count goes first and the shard
+    dim lands innermost, keeping each shard group contiguous in the rank order of the group being
+    split.
+    """
+    size = mesh.size()
+    assert size % hsdp_replica == 0, f"{size=} not divisible by {hsdp_replica=}"
+    return mesh._unflatten(0, (hsdp_replica, size // hsdp_replica), ("replica", "shard"))
+
+
+def apply_fsdp(model, hsdp_replica: int = 1):
+    # Two parameter classes, each with its own replica group. The expt parameters are the routed
+    # expert weights, unique per EP rank and replicated over the dp axis of the expert view; the
+    # attn parameters are everything else, replicated over the whole dp x cp stage. Hence the
+    # separate fully_shard call on the experts below: the FSDP2 module walk stops at an
+    # already-sharded submodule, so the outer call never sees the expt parameters.
+    expt_fsdp_mesh = distributed.expt_mesh["dp"]
+    if hsdp_replica > 1:
+        # Flatten under a separate name: _unflatten takes the flattened dim away from the mesh
+        # it came from, and the load-balance group in setup_model reads the default flattening.
+        attn_fsdp_mesh = distributed.attn_mesh["dp", "cp"]._flatten("hsdp_stage")
+        attn_fsdp_mesh = split_replicas(attn_fsdp_mesh, hsdp_replica)
+        expt_fsdp_mesh = split_replicas(expt_fsdp_mesh, hsdp_replica)
     else:
-        raise ValueError(f"Unknown sharding_strategy: {sharding_strategy!r}")
+        attn_fsdp_mesh = distributed.attn_mesh["dp", "cp"]._flatten()
     mp = MixedPrecisionPolicy(
         param_dtype=training.PARAM_DTYPE,
         reduce_dtype=torch.float32,
@@ -359,20 +366,29 @@ def apply_fsdp(
         # owns parameters. reshard_after_forward=True since each runs once per step.
         for name, child in model[i].named_children():
             if name != "layers" and next(child.parameters(), None) is not None:
-                fully_shard(child, mesh=other_fsdp_mesh, reshard_after_forward=True, mp_policy=mp)
+                fully_shard(child, mesh=attn_fsdp_mesh, reshard_after_forward=True, mp_policy=mp)
         for layer in model[i].layers.values():
             if hasattr(layer.mlp, "experts"):
                 fully_shard(
                     layer.mlp.experts,
-                    mesh=moe_fsdp_mesh,
+                    mesh=expt_fsdp_mesh,
                     reshard_after_forward=False,
                     mp_policy=mp,
                 )
-            fully_shard(layer, mesh=other_fsdp_mesh, reshard_after_forward=False, mp_policy=mp)
+            fully_shard(layer, mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp)
             torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage1")
             torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage3")
             torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage5")
-        fully_shard(model[i], mesh=other_fsdp_mesh, reshard_after_forward=False, mp_policy=mp)
+        fully_shard(model[i], mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp)
+
+    # Sum gradients instead of the FSDP2 default average. The two classes reduce over groups of
+    # different size, attn over dp x cp and expt over the expert dp axis, yet either sum is
+    # already the true global gradient: an expert is fed the tokens of its whole EP group through
+    # the all-to-all. Summing puts both classes on the same scale, and the training step applies
+    # the one normalization, by the global token count.
+    for module in model.modules():
+        if isinstance(module, FSDPModule):
+            module.set_gradient_divide_factor(1.0)
     return model
 
 
@@ -385,8 +401,6 @@ def setup_model(
     training.GroupedLinear = FP8GroupedLinear if cfg.fp8 else GroupedLinear
 
     cp_size = distributed.cp_size
-
-    device_mesh = distributed.device_mesh
     cp_group = distributed.cp_group
 
     modules = []
@@ -423,7 +437,7 @@ def setup_model(
         init_weights(module, num_layers, cfg.init_std)
 
     modules = nn.Sequential(*modules)
-    apply_fsdp(modules, device_mesh, distributed_cfg.sharding_strategy)
+    apply_fsdp(modules, distributed_cfg.hsdp_replica)
 
     # The two V-chunks build identical read-only rotary caches; share one to save memory.
     if hasattr(modules[0], "rotary_emb") and hasattr(modules[1], "rotary_emb"):
@@ -433,7 +447,9 @@ def setup_model(
 
     # Propagate MoE load balance loss to gate modules.
     if cfg.moe_load_balance_coef > 0:
-        dp_ep_group = device_mesh["dp", "ep"]._flatten().get_group()
+        # Global-batch statistics cover every rank holding tokens for this stage, the same flat
+        # dp x cp mesh apply_fsdp already built, so this adds no communicator.
+        lb_group = distributed.attn_mesh["dp", "cp"]._flatten().get_group()
         for i in range(2):
             for layer in modules[i].layers.values():
                 gate = getattr(layer.mlp, "gate", None) or getattr(layer.mlp, "router", None)
@@ -441,7 +457,7 @@ def setup_model(
                     loss_fn = make_load_balance_loss_fn(
                         cfg.moe_load_balance_type,
                         cfg.moe_load_balance_coef,
-                        dp_ep_group,
+                        lb_group,
                         sequence_length=local_seq_len,
                         cp_group=cp_group,
                     )

@@ -58,10 +58,11 @@ def get_global_batch(cfg: PretrainLMCfg, device: torch.device) -> List[Microbatc
     """
     Gather this rank's portion of the global batch, already split into micro-batches.
 
-    Every pipeline rank reads the same rows: the offsets below depend on the step and on the
-    data, expert and context ranks, never on the pipeline rank, so each builds an identical list
-    and DualPipeV needs no broadcast to learn the shapes. Only the first rank consumes the
-    tensors, since under the V-shape it holds both the embedding and the loss.
+    dp_rank alone decides which data this rank loads: the expert rank names the experts a rank
+    hosts, never the data it sees. Every pipeline rank loads the same samples, since the offsets
+    below follow the step and the data and context ranks and never the pipeline rank, so each
+    builds an identical list and DualPipeV needs no broadcast to learn the shapes. Only the first
+    rank consumes the tensors, since under the V-shape it holds both the embedding and the loss.
     """
     # short-hands
     step = training.step
@@ -69,15 +70,13 @@ def get_global_batch(cfg: PretrainLMCfg, device: torch.device) -> List[Microbatc
     global_batch_size = cfg.training.global_batch_size
     dp_size = distributed.dp_size
     dp_rank = distributed.dp_rank
-    ep_size = distributed.ep_size
-    ep_rank = distributed.ep_rank
     sequence_length = cfg.training.sequence_length
     dataset = training.dataset
 
     # arithmetic for dataset indices
-    effective_batch_size = micro_batch_size * dp_size * ep_size
-    local_batch_size = global_batch_size // (dp_size * ep_size)
-    start0 = step * global_batch_size + (dp_rank * ep_size + ep_rank) * micro_batch_size
+    effective_batch_size = micro_batch_size * dp_size
+    local_batch_size = global_batch_size // dp_size
+    start0 = step * global_batch_size + dp_rank * micro_batch_size
 
     # Zigzag context-parallel sharding. We split the global sequence into
     # 2*cp_size equal chunks and assign rank r the pair (r, 2*cp_size-r-1).
@@ -146,10 +145,16 @@ def objective(
 
 
 @torch.no_grad()
-def clip_grad_norm_(model: nn.Module, max_norm: float, norm_type: float = 2.0) -> torch.Tensor:
+def clip_grad_norm_(
+    model: nn.Module, max_norm: float, norm_type: float = 2.0, hsdp_replica: int = 1
+) -> torch.Tensor:
     """
     Clip gradients by global norm across all ranks (FSDP + pipeline).
     Returns the total gradient norm before clipping.
+
+    The world-wide sum counts each gradient element once, since every element lives on a single
+    rank. At hsdp_replica above 1 each element sits on that many ranks, so the summed square is
+    divided by the same count.
     """
     grads = []
     for p in model.parameters():
@@ -167,6 +172,7 @@ def clip_grad_norm_(model: nn.Module, max_norm: float, norm_type: float = 2.0) -
     # Global L2 norm: all-reduce sum of squared norms across all ranks (FSDP + pipeline).
     local_norm_sq = local_norm**norm_type
     torch.distributed.all_reduce(local_norm_sq, op=torch.distributed.ReduceOp.SUM)
+    local_norm_sq = local_norm_sq / hsdp_replica
     total_norm = (local_norm_sq ** (1.0 / norm_type)).clamp(min=1e-6)
     clip_coef = (max_norm / total_norm).clamp(max=1.0)
     if clip_coef < 1.0:
@@ -378,10 +384,9 @@ def train_step(cfg: PretrainLMCfg) -> None:
     model.train()
 
     dp_size = distributed.dp_size
-    ep_size = distributed.ep_size
     micro_batch_size = cfg.training.micro_batch_size
     global_batch_size = cfg.training.global_batch_size
-    assert global_batch_size % (micro_batch_size * dp_size * ep_size) == 0
+    assert global_batch_size % (micro_batch_size * dp_size) == 0
 
     # Gather the data for this rank's portion of the global batch, split into micro-batches.
     microbatches = get_global_batch(cfg, device)
@@ -407,13 +412,20 @@ def train_step(cfg: PretrainLMCfg) -> None:
             torch.distributed.all_reduce(loss, group=distributed.cp_group)
             loss /= cp_size
 
-    scale = 1.0 / num_tokens
+    # The one gradient normalization. FSDP reduces with a plain sum (see apply_fsdp), so dividing
+    # by the global token count leaves every parameter, attn or expt, at the token-weighted mean.
+    # Tokens split dp ways across the batch and cp ways along the sequence, so the global count
+    # is the local count times dp * cp, which holds only while every rank counts the same number
+    # of tokens: true for pretraining, not for packed data with -100 masks.
+    scale = 1.0 / (num_tokens * distributed.dp_size * distributed.cp_size)
     for p in model.parameters():
         if p.grad is not None:
             p.grad.mul_(scale)
 
     # Clip the gradients.
-    gradient_norm = clip_grad_norm_(model, max_norm=1.0, norm_type=2)
+    gradient_norm = clip_grad_norm_(
+        model, max_norm=1.0, norm_type=2, hsdp_replica=cfg.distributed.hsdp_replica
+    )
 
     # Take an optimization step (composed optimizers + their schedulers).
     for optimizer, scheduler in zip(optimizers, schedulers):
